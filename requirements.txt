@@ -1,0 +1,10 @@
+streamlit>=1.37
+pydantic>=2.7
+python-dotenv>=1.0
+openai>=1.52
+sentence-transformers>=2.6
+faiss-cpu>=1.8
+beautifulsoup4>=4.12
+requests>=2.31
+numpy>=1.26
+tqdm>=4.66
