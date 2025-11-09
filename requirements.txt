@@ -1,10 +1,9 @@
 streamlit>=1.37
 pydantic>=2.7
 python-dotenv>=1.0
-openai>=1.52
-sentence-transformers>=2.6
-faiss-cpu>=1.8
-beautifulsoup4>=4.12
-requests>=2.31
-numpy>=1.26
-tqdm>=4.66
+openai>=1.40
+tiktoken>=0.7
+nest-asyncio>=1.6
+langchain-core>=0.3
+langchain-openai>=0.2
+langchain-milvus>=0.1
