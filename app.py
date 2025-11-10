@@ -297,6 +297,19 @@ def _save_feedback(row: Dict[str, Any]):
 # ---------------------------------------------------------------------
 # 🎨 Streamlit UI
 # ---------------------------------------------------------------------
+def _clear_app_state():
+    # wipe chat history + input box
+    st.session_state.pop("history", None)
+    st.session_state["q_input"] = ""
+    # rerun (new API first, then fallback if needed)
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()  # for older Streamlit
+        except Exception:
+            pass
+
 def main():
     st.set_page_config(page_title="MS-ADS RAG Assistant", page_icon="🧠", layout="wide")
 
@@ -393,16 +406,13 @@ def main():
     )
 
     # Question box
-    q = st.text_input("Your question", placeholder="e.g., What are the core courses and can I study part-time online?")
+    q = st.text_input("Your question", placeholder="e.g., What are the core courses and can I study part-time online?",key="q_input",)
     colA, colB = st.columns([1, 1])
     with colA:
         ask = st.button("Ask", type="primary")
     with colB:
-        clear = st.button("Clear")
+        st.button("Clear", on_click=_clear_app_state)
 
-    if clear:
-        st.session_state.history = []
-        st.experimental_rerun()
 
     if ask and q.strip():
         run_id = str(uuid.uuid4())
