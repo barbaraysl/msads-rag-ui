@@ -29,9 +29,13 @@ from typing import List, Dict, Any, Optional, Tuple
 import streamlit as st
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import nest_asyncio
 
-nest_asyncio.apply()
+# Optional, guard nest_asyncio to avoid ModuleNotFoundError on Cloud
+try:  # <<< added
+    import nest_asyncio
+    nest_asyncio.apply()
+except Exception:
+    pass
 
 # LangChain core
 from langchain_core.prompts import ChatPromptTemplate
@@ -298,8 +302,9 @@ def _save_feedback(row: Dict[str, Any]):
 # 🎨 Streamlit UI
 # ---------------------------------------------------------------------
 def _clear_app_state():
-    # wipe chat history + input box
-    st.session_state.pop("history", None)
+    # wipe chat history + input box + last result  # <<< added
+    for k in ("history", "last_q", "last_resp", "last_params", "rendered_this_run"):
+        st.session_state.pop(k, None)
     st.session_state["q_input"] = ""
     # rerun (new API first, then fallback if needed)
     try:
@@ -312,6 +317,16 @@ def _clear_app_state():
 
 def main():
     st.set_page_config(page_title="MS-ADS RAG Assistant", page_icon="🧠", layout="wide")
+
+    # --- persistent state for Top-K/temperature changes (fix disappearing content) ---
+    if "last_q" not in st.session_state:            # <<< added
+        st.session_state.last_q = None
+    if "last_resp" not in st.session_state:         # <<< added
+        st.session_state.last_resp = None
+    if "last_params" not in st.session_state:       # <<< added
+        st.session_state.last_params = None
+    if "rendered_this_run" not in st.session_state: # <<< added
+        st.session_state.rendered_this_run = False
 
     if "history" not in st.session_state:
         st.session_state.history = []  # list of dicts
@@ -326,6 +341,11 @@ def main():
         stream_mode = st.toggle("Stream answer", value=True)
         show_chunks = st.toggle("Show retrieved chunks", value=True)
         show_debug = st.toggle("Show debug info", value=False)
+        auto_requery = st.toggle(                      # <<< added
+            "Auto re-run on change",
+            value=True,
+            help="Re-run the last question when Top-K/Temperature change",
+        )
         st.markdown("---")
         st.caption("💾 Export")
         if st.button("Download conversation as JSON"):
@@ -405,16 +425,40 @@ def main():
         "The assistant retrieves relevant sections and generates a grounded answer."
     )
 
+    # --- Auto re-run on parameter change (non-streaming) ---
+    curr_params = {  # <<< added
+        "top_k": top_k,
+        "temperature": temperature,
+        "stream": stream_mode,
+        "max_tokens": max_tokens,
+    }
+    if auto_requery and st.session_state.last_q and st.session_state.last_params and st.session_state.last_params != curr_params:  # <<< added
+        try:
+            _resp = invoke_rag(
+                st.session_state.last_q,
+                top_k=curr_params["top_k"],
+                temperature=curr_params["temperature"],
+                max_tokens=curr_params["max_tokens"],
+            )
+            st.session_state.last_resp = _resp.model_dump()
+            st.session_state.last_params = curr_params
+        except Exception as e:
+            st.warning(f"Auto re-run failed: {e}")
+
     # Question box
-    q = st.text_input("Your question", placeholder="e.g., What are the core courses and can I study part-time online?",key="q_input",)
+    q = st.text_input(
+        "Your question",
+        placeholder="e.g., What are the core courses and can I study part-time online?",
+        key="q_input",
+    )
     colA, colB = st.columns([1, 1])
     with colA:
         ask = st.button("Ask", type="primary")
     with colB:
         st.button("Clear", on_click=_clear_app_state)
 
-
     if ask and q.strip():
+        st.session_state.rendered_this_run = False  # <<< added
         run_id = str(uuid.uuid4())
         already_streamed = False
 
@@ -429,6 +473,12 @@ def main():
                 except Exception as e2:
                     st.error(f"RAG pipeline error: {e2}")
                     return
+                else:
+                    # store last result for persistence  # <<< added
+                    st.session_state.last_q = q.strip()
+                    st.session_state.last_resp = resp.model_dump()
+                    st.session_state.last_params = curr_params
+                    st.session_state.rendered_this_run = True
             else:
                 # ✅ Answer FIRST (streamed)
                 st.write("## 🧠 Answer")
@@ -442,6 +492,12 @@ def main():
                 placeholder.write(final_answer + (" " + labels_inline if labels_inline else ""))
                 resp = RagResponse(answer=final_answer, citations=stream_citations)
                 already_streamed = True
+
+                # store last result for persistence  # <<< added
+                st.session_state.last_q = q.strip()
+                st.session_state.last_resp = resp.model_dump()
+                st.session_state.last_params = curr_params
+                st.session_state.rendered_this_run = True
 
                 # 📚 Sources AFTER the answer
                 st.markdown("---")
@@ -469,29 +525,93 @@ def main():
             except Exception as e:
                 st.error(f"RAG pipeline error: {e}")
                 return
+            else:
+                # store last result for persistence  # <<< added
+                st.session_state.last_q = q.strip()
+                st.session_state.last_resp = resp.model_dump()
+                st.session_state.last_params = curr_params
+                st.session_state.rendered_this_run = True
 
         # Render answer again only if not already printed via stream
-        citation_labels = {i: _mk_citation_label(i) for i in range(len(resp.citations))}
-        labels_inline = " ".join(citation_labels.values()) if resp.citations else ""
-        if not already_streamed:
-            st.write("## 🧠 Answer")
-            st.write(resp.answer + (" " + labels_inline if labels_inline else ""))
+        if ask:  # still inside ask branch
+            citation_labels = {i: _mk_citation_label(i) for i in range(len(resp.citations))}
+            labels_inline = " ".join(citation_labels.values()) if resp.citations else ""
+            if not already_streamed:
+                st.write("## 🧠 Answer")
+                st.write(resp.answer + (" " + labels_inline if labels_inline else ""))
 
-        # Feedback row — visible for both modes
+            # Feedback row — visible for both modes
+            fb_cols = st.columns([0.15, 0.15, 0.7])
+            if fb_cols[0].button("👍 Helpful", key=f"up_{run_id}"):
+                _save_feedback({"run_id": run_id, "question": q, "feedback": "up", "ts": time.time()})
+                st.toast("Thanks for the feedback!", icon="👍")
+            if fb_cols[1].button("👎 Not helpful", key=f"down_{run_id}"):
+                _save_feedback({"run_id": run_id, "question": q, "feedback": "down", "ts": time.time()})
+                st.toast("We’ll use this to improve.", icon="🛠️")
+
+            # Sources panel for non-streaming (Answer is already above)
+            if not stream_mode and resp.citations:
+                st.markdown("---")
+                st.write("## 📚 Sources")
+                for i, c in enumerate(resp.citations):
+                    label = f"{_mk_citation_label(i)} {c.title}"
+                    if c.url:
+                        st.markdown(
+                            f"**{label}**  ·  <span class='src'><a href='{c.url}' target='_blank'>{c.url}</a></span>",
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.markdown(f"**{label}**", unsafe_allow_html=True)
+                    if show_chunks:
+                        with st.expander("Show retrieved passage"):
+                            query_terms = [t for t in re.split(r"\W+", q) if len(t) > 2]
+                            st.markdown(f"<div class='chunk'>{_highlight(c.chunk, query_terms)}</div>", unsafe_allow_html=True)
+                    if c.score is not None:
+                        st.markdown(f"<span class='badge'>score {c.score:.3f}</span>", unsafe_allow_html=True)
+
+            # Debug box
+            if show_debug:
+                st.write("## Debug")
+                st.json(
+                    {
+                        "latency_ms": getattr(resp, "latency_ms", None),
+                        "retrieved": len(resp.citations),
+                        "openai": bool(os.getenv("OPENAI_API_KEY")),
+                    }
+                )
+
+            # Save history
+            st.session_state.history.append(
+                {
+                    "question": q,
+                    "response": resp.model_dump(),
+                    "params": {"top_k": top_k, "temperature": temperature, "max_tokens": max_tokens, "stream": stream_mode},
+                    "ts": time.time(),
+                }
+            )
+
+    # --- Persistent render: if nothing printed this run, show last result ---  # <<< added
+    if st.session_state.last_resp and not st.session_state.rendered_this_run:
+        _last = RagResponse(**st.session_state.last_resp)
+        citation_labels = {i: f"[{i+1}]" for i in range(len(_last.citations))}
+        labels_inline = " ".join(citation_labels.values()) if _last.citations else ""
+
+        st.write("## 🧠 Answer")
+        st.write(_last.answer + (" " + labels_inline if labels_inline else ""))
+
         fb_cols = st.columns([0.15, 0.15, 0.7])
-        if fb_cols[0].button("👍 Helpful", key=f"up_{run_id}"):
-            _save_feedback({"run_id": run_id, "question": q, "feedback": "up", "ts": time.time()})
+        if fb_cols[0].button("👍 Helpful", key=f"up_last"):
+            _save_feedback({"run_id": "last", "question": st.session_state.last_q, "feedback": "up", "ts": time.time()})
             st.toast("Thanks for the feedback!", icon="👍")
-        if fb_cols[1].button("👎 Not helpful", key=f"down_{run_id}"):
-            _save_feedback({"run_id": run_id, "question": q, "feedback": "down", "ts": time.time()})
+        if fb_cols[1].button("👎 Not helpful", key=f"down_last"):
+            _save_feedback({"run_id": "last", "question": st.session_state.last_q, "feedback": "down", "ts": time.time()})
             st.toast("We’ll use this to improve.", icon="🛠️")
 
-        # Sources panel for non-streaming (Answer is already above)
-        if not stream_mode and resp.citations:
+        if _last.citations:
             st.markdown("---")
             st.write("## 📚 Sources")
-            for i, c in enumerate(resp.citations):
-                label = f"{_mk_citation_label(i)} {c.title}"
+            for i, c in enumerate(_last.citations):
+                label = f"[{i+1}] {c.title}"
                 if c.url:
                     st.markdown(
                         f"**{label}**  ·  <span class='src'><a href='{c.url}' target='_blank'>{c.url}</a></span>",
@@ -501,31 +621,10 @@ def main():
                     st.markdown(f"**{label}**", unsafe_allow_html=True)
                 if show_chunks:
                     with st.expander("Show retrieved passage"):
-                        query_terms = [t for t in re.split(r"\W+", q) if len(t) > 2]
+                        query_terms = [t for t in re.split(r"\W+", st.session_state.last_q or "") if len(t) > 2]
                         st.markdown(f"<div class='chunk'>{_highlight(c.chunk, query_terms)}</div>", unsafe_allow_html=True)
                 if c.score is not None:
                     st.markdown(f"<span class='badge'>score {c.score:.3f}</span>", unsafe_allow_html=True)
-
-        # Debug box
-        if show_debug:
-            st.write("## Debug")
-            st.json(
-                {
-                    "latency_ms": getattr(resp, "latency_ms", None),
-                    "retrieved": len(resp.citations),
-                    "openai": bool(os.getenv("OPENAI_API_KEY")),
-                }
-            )
-
-        # Save history
-        st.session_state.history.append(
-            {
-                "question": q,
-                "response": resp.model_dump(),
-                "params": {"top_k": top_k, "temperature": temperature, "max_tokens": max_tokens, "stream": stream_mode},
-                "ts": time.time(),
-            }
-        )
 
     # Conversation History
     if st.session_state.history:
